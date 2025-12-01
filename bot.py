@@ -10,6 +10,7 @@ from polymarket_client import PolymarketClient
 from spike_detector import SpikeDetector
 from strategy import MeanReversionStrategy
 from position_manager import PositionManager
+from orderbook import OrderbookAnalyzer, OrderTracker
 
 
 class MeanReversionBot:
@@ -26,6 +27,8 @@ class MeanReversionBot:
         self.detector = SpikeDetector(self.client)
         self.strategy = MeanReversionStrategy()
         self.positions = PositionManager(client=self.client)
+        self.orderbook_analyzer = OrderbookAnalyzer()
+        self.order_tracker = OrderTracker()
         self.running = False
         self.scan_interval = 30  # seconds between scans
 
@@ -74,7 +77,10 @@ class MeanReversionBot:
                 # 2. Update baseline prices
                 await self.detector.update_baselines(markets)
 
-                # 3. Scan for spike opportunities
+                # 3. Check and cancel stale orders
+                await self._manage_open_orders()
+
+                # 4. Scan for spike opportunities
                 signals = await self.detector.scan_markets(markets)
 
                 if signals:
@@ -85,12 +91,19 @@ class MeanReversionBot:
                         if not self.positions.can_open_position(sig.token_id_no):
                             continue
 
-                        # Evaluate signal
-                        decision = self.strategy.evaluate(sig)
+                        # Get NO orderbook for smart order placement
+                        no_orderbook = await self.client.get_orderbook(sig.token_id_no)
+
+                        # Evaluate signal with orderbook data
+                        decision = self.strategy.evaluate(sig, no_orderbook)
 
                         if decision and decision.size > 0:
                             print(f"\n  TRADE: {decision.reason}")
                             print(f"    Market: {sig.market.question[:50]}...")
+
+                            if decision.order_params:
+                                print(f"    Urgency: {decision.order_params.urgency.value}")
+                                print(f"    Queue position: ~{decision.order_params.expected_queue_position}")
 
                             # Place order
                             order_id = await self.client.place_order(
@@ -101,6 +114,15 @@ class MeanReversionBot:
                             )
 
                             if order_id:
+                                # Track the order
+                                self.order_tracker.add_order(
+                                    order_id=order_id,
+                                    token_id=decision.token_id,
+                                    price=decision.limit_price,
+                                    size=decision.size,
+                                    params=decision.order_params,
+                                )
+
                                 self.positions.add_position(
                                     token_id=decision.token_id,
                                     market_question=sig.market.question,
@@ -111,7 +133,7 @@ class MeanReversionBot:
                         elif decision:
                             print(f"  Skip: {decision.reason}")
 
-                # 4. Update and check existing positions
+                # 5. Update and check existing positions
                 await self.positions.update_positions()
                 exits = await self.positions.check_exits()
 
@@ -119,15 +141,71 @@ class MeanReversionBot:
                     # In production, you'd place a sell order here
                     self.positions.close_position(token_id)
 
-                # 5. Print status
+                # 6. Print status
                 self.positions.print_status()
+                self._print_order_status()
+
+                # Cleanup old tracked orders
+                self.order_tracker.cleanup_old_orders()
 
                 # Wait before next scan
                 await asyncio.sleep(self.scan_interval)
 
             except Exception as e:
                 print(f"Error in main loop: {e}")
+                import traceback
+                traceback.print_exc()
                 await asyncio.sleep(10)
+
+    async def _manage_open_orders(self):
+        """Check open orders and cancel stale ones."""
+        open_orders = self.order_tracker.get_open_orders()
+
+        for order in open_orders:
+            order_id = order["order_id"]
+            token_id = order["token_id"]
+            order_price = order["price"]
+            order_age = self.order_tracker.get_order_age(order_id)
+
+            # Get current orderbook
+            orderbook = await self.client.get_orderbook(token_id)
+            analysis = self.orderbook_analyzer.analyze(orderbook)
+
+            # Get original spike info if available
+            original_spike = 0.20  # Default assumption
+            if order.get("params"):
+                # Could store this, for now use default
+                pass
+
+            # Check if we should cancel
+            should_cancel, reason = self.orderbook_analyzer.should_cancel_order(
+                order_price=order_price,
+                order_age_seconds=order_age,
+                current_analysis=analysis,
+                original_spike_pct=original_spike,
+            )
+
+            if should_cancel:
+                print(f"  Cancelling order {order_id[:8]}...: {reason}")
+                success = await self.client.cancel_order(order_id)
+                if success:
+                    self.order_tracker.cancel_order(order_id)
+
+    def _print_order_status(self):
+        """Print status of open orders."""
+        open_orders = self.order_tracker.get_open_orders()
+
+        if not open_orders:
+            return
+
+        print(f"\nOpen Orders ({len(open_orders)}):")
+        for order in open_orders:
+            age = self.order_tracker.get_order_age(order["order_id"])
+            print(
+                f"  {order['order_id'][:8]}... | "
+                f"${order['size']:.2f} @ {order['price']:.2f} | "
+                f"Age: {age:.0f}s"
+            )
 
 
 async def main():
