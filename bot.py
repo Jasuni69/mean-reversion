@@ -41,8 +41,13 @@ class MeanReversionBot:
     async def start(self):
         """Start the bot."""
         print("\n" + "=" * 60)
-        print("NO Mean Reversion Bot")
-        print("=" * 60)
+        if config.dry_run:
+            print("NO Mean Reversion Bot [DRY RUN MODE]")
+            print("=" * 60)
+            print("*** NO REAL TRADES WILL BE PLACED ***")
+        else:
+            print("NO Mean Reversion Bot [LIVE MODE]")
+            print("=" * 60)
         print(f"Strategy: Buy NO when YES spikes >{config.min_spike_threshold:.0%}")
         print(f"Max position: ${config.max_position_size}")
         print(f"Max positions: {config.max_open_positions}")
@@ -128,48 +133,27 @@ class MeanReversionBot:
                         decision = self.strategy.evaluate(sig, no_orderbook)
 
                         if decision and decision.size > 0 and outcome == SignalOutcome.TRADED:
-                            print(f"\n  TRADE: {decision.reason}")
-                            print(f"    Market: {sig.market.question[:50]}...")
-
                             urgency_str = "unknown"
                             queue_pos = 0
                             if decision.order_params:
                                 urgency_str = decision.order_params.urgency.value
                                 queue_pos = decision.order_params.expected_queue_position
+
+                            if config.dry_run:
+                                # Dry run - log but don't place order
+                                print(f"\n  [DRY RUN] WOULD TRADE: {decision.reason}")
+                                print(f"    Market: {sig.market.question[:50]}...")
+                                print(f"    Size: ${decision.size:.2f} @ {decision.limit_price:.2f}")
                                 print(f"    Urgency: {urgency_str}")
                                 print(f"    Queue position: ~{queue_pos}")
 
-                            # Place order
-                            order_id = await self.client.place_order(
-                                token_id=decision.token_id,
-                                side=decision.side,
-                                size=decision.size,
-                                price=decision.limit_price,
-                            )
+                                # Generate fake order ID for tracking
+                                import uuid
+                                trade_id = f"dry-run-{uuid.uuid4().hex[:8]}"
 
-                            if order_id:
-                                trade_id = order_id
-
-                                # Track the order
-                                self.order_tracker.add_order(
-                                    order_id=order_id,
-                                    token_id=decision.token_id,
-                                    price=decision.limit_price,
-                                    size=decision.size,
-                                    params=decision.order_params,
-                                )
-
-                                self.positions.add_position(
-                                    token_id=decision.token_id,
-                                    market_question=sig.market.question,
-                                    entry_price=decision.limit_price,
-                                    size=decision.size,
-                                    order_id=order_id,
-                                )
-
-                                # Record trade entry
+                                # Still record for analytics
                                 self.metrics.record_trade_entry(
-                                    trade_id=order_id,
+                                    trade_id=trade_id,
                                     market_id=sig.market.condition_id,
                                     market_question=sig.market.question,
                                     signal_spike_pct=sig.spike_pct,
@@ -178,8 +162,61 @@ class MeanReversionBot:
                                     order_urgency=urgency_str,
                                     queue_position=queue_pos,
                                 )
+
+                                # Track simulated position for outcome monitoring
+                                self._pending_signal_checks.append({
+                                    "market_id": sig.market.condition_id,
+                                    "token_id": sig.market.token_id_yes,
+                                    "timestamp": sig.timestamp,
+                                    "checks_remaining": [5, 15, 60],
+                                    "trade_id": trade_id,
+                                    "entry_no_price": decision.limit_price,
+                                })
                             else:
-                                outcome = SignalOutcome.MISSED
+                                # Live mode - place real order
+                                print(f"\n  TRADE: {decision.reason}")
+                                print(f"    Market: {sig.market.question[:50]}...")
+                                print(f"    Urgency: {urgency_str}")
+                                print(f"    Queue position: ~{queue_pos}")
+
+                                order_id = await self.client.place_order(
+                                    token_id=decision.token_id,
+                                    side=decision.side,
+                                    size=decision.size,
+                                    price=decision.limit_price,
+                                )
+
+                                if order_id:
+                                    trade_id = order_id
+
+                                    self.order_tracker.add_order(
+                                        order_id=order_id,
+                                        token_id=decision.token_id,
+                                        price=decision.limit_price,
+                                        size=decision.size,
+                                        params=decision.order_params,
+                                    )
+
+                                    self.positions.add_position(
+                                        token_id=decision.token_id,
+                                        market_question=sig.market.question,
+                                        entry_price=decision.limit_price,
+                                        size=decision.size,
+                                        order_id=order_id,
+                                    )
+
+                                    self.metrics.record_trade_entry(
+                                        trade_id=order_id,
+                                        market_id=sig.market.condition_id,
+                                        market_question=sig.market.question,
+                                        signal_spike_pct=sig.spike_pct,
+                                        entry_price=decision.limit_price,
+                                        entry_size=decision.size,
+                                        order_urgency=urgency_str,
+                                        queue_position=queue_pos,
+                                    )
+                                else:
+                                    outcome = SignalOutcome.MISSED
                         elif decision:
                             # Decision made but size is 0
                             if "too low" in decision.reason:
@@ -294,6 +331,9 @@ class MeanReversionBot:
 
     async def _manage_open_orders(self):
         """Check open orders and cancel stale ones."""
+        if config.dry_run:
+            return  # No real orders to manage in dry run
+
         open_orders = self.order_tracker.get_open_orders()
 
         for order in open_orders:

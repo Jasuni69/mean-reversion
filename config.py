@@ -1,4 +1,5 @@
 import os
+import sys
 from dataclasses import dataclass
 from dotenv import load_dotenv
 
@@ -15,6 +16,9 @@ class TradingConfig:
     api_secret: str = os.getenv("API_SECRET", "")
     api_passphrase: str = os.getenv("API_PASSPHRASE", "")
     chain_id: int = int(os.getenv("CHAIN_ID", "137"))
+
+    # Dry run mode - no actual trades placed
+    dry_run: bool = "--dry-run" in sys.argv or os.getenv("DRY_RUN", "false").lower() == "true"
 
     # Strategy parameters
     min_spike_threshold: float = float(os.getenv("MIN_SPIKE_THRESHOLD", "0.20"))
