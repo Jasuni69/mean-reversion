@@ -1,6 +1,7 @@
 """Polymarket API client for market data and trading."""
 
 import asyncio
+import json
 import time
 from typing import Optional
 from dataclasses import dataclass
@@ -85,25 +86,33 @@ class PolymarketClient:
             markets = []
 
             for item in data:
-                # Skip markets without proper token structure
-                if not item.get("clobTokenIds") or len(item["clobTokenIds"]) < 2:
-                    continue
-
                 try:
+                    # Parse clobTokenIds - can be JSON string or list
+                    token_ids = item.get("clobTokenIds")
+                    if isinstance(token_ids, str):
+                        token_ids = json.loads(token_ids)
+                    if not token_ids or len(token_ids) < 2:
+                        continue
+
+                    # Parse outcomePrices - can be JSON string or list
+                    prices = item.get("outcomePrices", "[0.5, 0.5]")
+                    if isinstance(prices, str):
+                        prices = json.loads(prices)
+
                     markets.append(
                         Market(
                             condition_id=item["conditionId"],
                             question=item.get("question", ""),
-                            token_id_yes=item["clobTokenIds"][0],
-                            token_id_no=item["clobTokenIds"][1],
-                            price_yes=float(item.get("outcomePrices", [0.5, 0.5])[0]),
-                            price_no=float(item.get("outcomePrices", [0.5, 0.5])[1]),
+                            token_id_yes=token_ids[0],
+                            token_id_no=token_ids[1],
+                            price_yes=float(prices[0]),
+                            price_no=float(prices[1]),
                             volume_24h=float(item.get("volume24hr", 0)),
                             liquidity=float(item.get("liquidity", 0)),
                             end_date=item.get("endDate"),
                         )
                     )
-                except (KeyError, IndexError, ValueError) as e:
+                except (KeyError, IndexError, ValueError, json.JSONDecodeError) as e:
                     continue
 
             return markets
@@ -111,7 +120,12 @@ class PolymarketClient:
     async def get_orderbook(self, token_id: str) -> dict:
         """Get orderbook for a token."""
         try:
-            return self.clob_client.get_order_book(token_id)
+            book = self.clob_client.get_order_book(token_id)
+            # Convert OrderBookSummary object to dict
+            return {
+                "bids": [{"price": b.price, "size": b.size} for b in (book.bids or [])],
+                "asks": [{"price": a.price, "size": a.size} for a in (book.asks or [])],
+            }
         except Exception as e:
             print(f"Error fetching orderbook: {e}")
             return {"bids": [], "asks": []}
