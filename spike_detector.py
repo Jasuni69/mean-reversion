@@ -35,7 +35,8 @@ class SpikeDetector:
         """Update baseline prices for markets we're tracking."""
         for market in markets:
             token_id = market.token_id_yes
-            current_price = await self.client.get_price(token_id)
+            # Use API price (last trade price) not orderbook mid
+            current_price = market.price_yes
 
             # Only update baseline if price is "normal" (not already spiked)
             if token_id not in self._baseline_prices:
@@ -61,8 +62,8 @@ class SpikeDetector:
         if now - last_spike < self._cooldown_seconds:
             return None
 
-        # Get current YES price
-        current_yes_price = await self.client.get_price(token_id)
+        # Get current YES price from API (not orderbook mid)
+        current_yes_price = market.price_yes
 
         # Get baseline (or use stored price from earlier)
         baseline = self._baseline_prices.get(token_id)
@@ -146,17 +147,33 @@ class SpikeDetector:
 
         return min(score, 1.0)
 
-    async def scan_markets(self, markets: list[Market]) -> list[SpikeSignal]:
+    async def scan_markets(self, markets: list[Market], debug: bool = True) -> list[SpikeSignal]:
         """Scan all markets for spike opportunities."""
         signals = []
+        price_changes = []
 
         # Filter for markets with sufficient liquidity
         tradeable = [m for m in markets if m.liquidity >= config.min_liquidity]
 
         for market in tradeable:
+            # Track price changes for debug using API price
+            token_id = market.token_id_yes
+            baseline = self._baseline_prices.get(token_id)
+            if baseline and baseline > 0:
+                current = market.price_yes
+                change = (current - baseline) / baseline
+                price_changes.append((market.question[:40], change, current, baseline))
+
             signal = await self.detect_spike(market)
             if signal:
                 signals.append(signal)
+
+        # Print top movers for debug
+        if debug and price_changes:
+            price_changes.sort(key=lambda x: abs(x[1]), reverse=True)
+            print(f"  Top movers (threshold: {config.min_spike_threshold:.0%}):")
+            for q, change, curr, base in price_changes[:3]:
+                print(f"    {change:+.1%} | {q}... (now:{curr:.2f} base:{base:.2f})")
 
         # Sort by confidence
         signals.sort(key=lambda s: s.confidence, reverse=True)

@@ -121,10 +121,10 @@ class PolymarketClient:
         """Get orderbook for a token."""
         try:
             book = self.clob_client.get_order_book(token_id)
-            # Convert OrderBookSummary object to dict
+            # Convert OrderBookSummary object to dict with float prices
             return {
-                "bids": [{"price": b.price, "size": b.size} for b in (book.bids or [])],
-                "asks": [{"price": a.price, "size": a.size} for a in (book.asks or [])],
+                "bids": [{"price": float(b.price), "size": float(b.size)} for b in (book.bids or [])],
+                "asks": [{"price": float(a.price), "size": float(a.size)} for a in (book.asks or [])],
             }
         except Exception as e:
             print(f"Error fetching orderbook: {e}")
